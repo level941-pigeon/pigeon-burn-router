@@ -25,6 +25,11 @@
 //   2. Add Account<'info, PriceUpdateV2> to ExecuteSellBurn
 //   3. Call price_update.get_price_no_older_than(&Clock::get()?, PYTH_MAX_AGE_SECONDS, &feed_id)?
 //   4. Derive pyth_floor, use pyth_floor.max(min_buyback_out) as effective floor
+//
+// SUPPLY FLOOR:
+//   941 tokens (941_000_000 raw units at 6 decimals) will always exist.
+//   When burn would drop supply below floor, burn is reduced to hit floor exactly.
+//   When supply is already at floor, burn step is skipped. Sell still completes.
 // ============================================================
 
 use anchor_lang::prelude::*;
@@ -56,6 +61,11 @@ pub const CONFIG_SEED: &[u8] = b"pigeon_burn_config";
 
 pub const DUST_SWEEP_CAP: u64 = 1_000_000;
 pub const MIGRATION_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+/// 941 tokens * 10^6 (6 decimals) = 941_000_000 raw units.
+/// The burn will never reduce supply below this floor.
+/// Verify PIGEON decimals on Solscan before deploy.
+pub const MIN_SUPPLY_FLOOR: u64 = 941_000_000;
 
 pub const PYTH_PIGEON_SOL_FEED_HEX: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -331,36 +341,50 @@ pub mod pigeon_burn_router {
             &rate_limiter_remaining,
         )?;
 
-        // STEP 5: BURN
+        // STEP 5: BURN with 941 token supply floor
+        // Burn never reduces supply below 941_000_000 raw units (941 tokens at 6 decimals).
+        // If supply is already at or below floor, burn is skipped entirely.
+        // Sell completes and seller receives SOL regardless.
         ctx.accounts.router_pigeon_burn_account.reload()?;
-        let to_burn = ctx
+        let to_burn_raw = ctx
             .accounts
             .router_pigeon_burn_account
             .amount
             .checked_sub(pigeon_before)
             .ok_or(BurnRouterError::MathOverflow)?;
-        require_gt!(to_burn, 0, BurnRouterError::NothingToBurn);
-        require_gte!(to_burn, min_buyback_out, BurnRouterError::SlippageExceeded);
+        require_gt!(to_burn_raw, 0, BurnRouterError::NothingToBurn);
+        require_gte!(to_burn_raw, min_buyback_out, BurnRouterError::SlippageExceeded);
 
-        token::burn(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Burn {
-                    mint: ctx.accounts.pigeon_mint.to_account_info(),
-                    from: ctx.accounts.router_pigeon_burn_account.to_account_info(),
-                    authority: ctx.accounts.config.to_account_info(),
-                },
-                signer_seeds,
-            ),
-            to_burn,
-        )?;
+        let current_supply = ctx.accounts.pigeon_mint.supply;
+        let effective_burn = if current_supply <= MIN_SUPPLY_FLOOR {
+            0
+        } else if current_supply.saturating_sub(to_burn_raw) < MIN_SUPPLY_FLOOR {
+            current_supply.saturating_sub(MIN_SUPPLY_FLOOR)
+        } else {
+            to_burn_raw
+        };
 
-        ctx.accounts.config.total_burned = ctx
-            .accounts
-            .config
-            .total_burned
-            .checked_add(to_burn)
-            .ok_or(BurnRouterError::MathOverflow)?;
+        if effective_burn > 0 {
+            token::burn(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Burn {
+                        mint: ctx.accounts.pigeon_mint.to_account_info(),
+                        from: ctx.accounts.router_pigeon_burn_account.to_account_info(),
+                        authority: ctx.accounts.config.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                effective_burn,
+            )?;
+
+            ctx.accounts.config.total_burned = ctx
+                .accounts
+                .config
+                .total_burned
+                .checked_add(effective_burn)
+                .ok_or(BurnRouterError::MathOverflow)?;
+        }
 
         // STEP 6: PAY SELLER
         token::transfer(
@@ -382,7 +406,7 @@ pub mod pigeon_burn_router {
             sol_received: wsol_received,
             burn_sol: burn_wsol,
             seller_sol: seller_wsol,
-            pigeon_burned: to_burn,
+            pigeon_burned: effective_burn,
             total_burned: ctx.accounts.config.total_burned,
             burn_bps: config.burn_bps,
         });
